@@ -21,6 +21,7 @@
       chores: clone(R.DEFAULT_CHORES),
       configAt: 0,      // when people/chores were last edited; newest wins when syncing
       done: {},         // instanceKey -> { v: true|false, by: 'A'|'B'|'', at: ISO time }
+      moves: {},        // instanceKey -> { person: 'A'|'B'|'', day: 0-6 or -1, at: ISO time }  (reassigned tasks)
       meals: [],
       ingredients: [],
     };
@@ -32,9 +33,13 @@
   const LS_UNLOCK = 'chores.unlock.v1';
   const EMPTY_SYNC = { owner: '', repo: '', path: 'chores.json', branch: 'main', token: '' };
 
-  // Password lock: config.js (optional) holds the sync details encrypted with the household password.
-  const LOCK = window.CHORES_LOCK && window.CHORES_LOCK.data ? window.CHORES_LOCK : null;
-  const lockId = LOCK ? LOCK.data.slice(0, 32) : '';
+  // Logins: config.js (optional) holds the sync details encrypted with each person's password.
+  // Two formats: v1 = one household password; v2 = a password per person ("users"), which also says who is logged in.
+  const RAW_LOCK = window.CHORES_LOCK;
+  const LOCK = RAW_LOCK && (RAW_LOCK.data || RAW_LOCK.users) ? RAW_LOCK : null;
+  const LOGINS = !!(LOCK && LOCK.users);
+  const lockId = LOCK ? (LOGINS ? LOCK.salt : LOCK.data.slice(0, 32)) : '';
+  let savedMe = '';
   let unlocked = !LOCK;
   let keepUnlocked = true;
   let sync = Object.assign({}, EMPTY_SYNC, LOCK ? {} : readJSON(LS_SYNC) || {});
@@ -43,9 +48,11 @@
     try { saved = saved || JSON.parse(sessionStorage.getItem(LS_UNLOCK)); } catch { /* blocked */ }
     if (saved && saved.lock === lockId && saved.sync) {
       sync = Object.assign({}, EMPTY_SYNC, saved.sync); keepUnlocked = !!saved.keep; unlocked = true;
+      savedMe = saved.me || '';
+      if (LOGINS && savedMe !== 'A' && savedMe !== 'B') unlocked = false; // old record without a login
     }
   }
-  let me = localStorage.getItem(LS_ME) || '';
+  let me = LOGINS ? savedMe : localStorage.getItem(LS_ME) || '';
   let tab = 'today';
   let weekOffset = 0;
   let editingId = null;
@@ -53,6 +60,26 @@
   const saveLocal = () => writeJSON(LS_STATE, state);
   const name = (p) => (state.people[p] && state.people[p].name) || `Person ${p}`;
   const isDone = (key) => !!(state.done[key] && state.done[key].v);
+  // Who gets the minutes: whoever ticked it, otherwise the person it was assigned to.
+  const doer = (it) => { const d = state.done[it.key]; return d && (d.by === 'A' || d.by === 'B') ? d.by : it.person; };
+  const credited = (items, p) => items.reduce((s, i) => s + (isDone(i.key) && doer(i) === p ? i.chore.minutes : 0), 0);
+
+  // The rota for week w, with any one-off reassignments applied on top.
+  function weekItems(w) {
+    const items = R.buildWeek(state.chores, w);
+    for (const it of items) {
+      it.planned = { person: it.person, day: it.day };
+      const mv = state.moves && state.moves[it.key];
+      if (mv) {
+        if (mv.person === 'A' || mv.person === 'B') it.person = mv.person;
+        if (mv.day >= 0 && mv.day <= 6) it.day = mv.day;
+      }
+      it.moved = it.person !== it.planned.person || it.day !== it.planned.day;
+    }
+    return items;
+  }
+  const findItem = (key) => weekItems(Number(key.split(':')[0])).find((i) => i.key === key);
+
   const touchConfig = () => { state.configAt = Date.now(); saveLocal(); schedulePush(); };
 
   function merge(local, remote) {
@@ -62,6 +89,10 @@
     out.done = Object.assign({}, local.done || {});
     for (const [k, v] of Object.entries(remote.done || {})) {
       if (!out.done[k] || (v.at || '') > (out.done[k].at || '')) out.done[k] = v;
+    }
+    out.moves = Object.assign({}, local.moves || {});
+    for (const [k, v] of Object.entries(remote.moves || {})) {
+      if (!out.moves[k] || (v.at || '') > (out.moves[k].at || '')) out.moves[k] = v;
     }
     return out;
   }
@@ -142,7 +173,7 @@
   }
   function schedulePush() { clearTimeout(pushTimer); pushTimer = setTimeout(push, 700); }
 
-  /* ---------- Password lock (AES-GCM, key from PBKDF2-SHA256) ---------- */
+  /* ---------- Logins (AES-GCM, key from PBKDF2-SHA256) ---------- */
   const ITERATIONS = 600000;
   const bytesToB64 = (bytes) => { let bin = ''; for (const b of bytes) bin += String.fromCharCode(b); return btoa(bin); };
   const b64ToBytes = (b64) => Uint8Array.from(atob(b64), (ch) => ch.charCodeAt(0));
@@ -164,7 +195,7 @@
   }
   function persistSync() {
     if (!LOCK) return writeJSON(LS_SYNC, sync);
-    const rec = JSON.stringify({ lock: lockId, sync, keep: keepUnlocked });
+    const rec = JSON.stringify({ lock: lockId, sync, keep: keepUnlocked, me: LOGINS ? me : '' });
     try {
       if (keepUnlocked) { localStorage.setItem(LS_UNLOCK, rec); sessionStorage.removeItem(LS_UNLOCK); }
       else { sessionStorage.setItem(LS_UNLOCK, rec); localStorage.removeItem(LS_UNLOCK); }
@@ -176,35 +207,63 @@
     if (!pass) return $('#lock-pass').focus();
     $('#unlockBtn').disabled = true; msg.className = 'status-line'; msg.textContent = 'Unlocking…';
     try {
-      sync = Object.assign({}, EMPTY_SYNC, await decryptConfig(LOCK, pass));
+      if (LOGINS) {
+        const key = await deriveKey(pass, b64ToBytes(LOCK.salt), LOCK.iterations || ITERATIONS);
+        let found = null;
+        for (const p of ['A', 'B']) {
+          const u = LOCK.users[p];
+          if (!u) continue;
+          try {
+            const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64ToBytes(u.iv) }, key, b64ToBytes(u.data));
+            found = { p, cfg: JSON.parse(new TextDecoder().decode(pt)) }; break;
+          } catch { /* not this person's password */ }
+        }
+        if (!found) throw new Error('wrong');
+        me = found.p; sync = Object.assign({}, EMPTY_SYNC, found.cfg);
+      } else {
+        sync = Object.assign({}, EMPTY_SYNC, await decryptConfig(LOCK, pass));
+      }
     } catch {
       $('#unlockBtn').disabled = false; msg.className = 'status-line error'; msg.textContent = 'Wrong password. Try again.';
       $('#lock-pass').select(); return;
     }
+    $('#lock-pass').value = '';
     keepUnlocked = $('#lock-keep').checked; unlocked = true; persistSync();
     render(); setStatus('ok'); pull();
   }
   async function makeLockFile() {
-    const out = $('#lockOut'); const p1 = $('#l-pass').value; const p2 = $('#l-pass2').value;
+    const out = $('#lockOut');
+    const pa = $('#l-passA').value, pa2 = $('#l-passA2').value, pb = $('#l-passB').value, pb2 = $('#l-passB2').value;
     const fail = (t) => { out.innerHTML = `<p class="status-line error">${esc(t)}</p>`; };
-    if (!syncReady()) return fail('Set up and test sync first: the lock file stores those details.');
-    if (p1.length < 12) return fail('Use at least 12 characters. Four random words works well.');
-    if (p1 !== p2) return fail('The two passwords do not match.');
+    if (!syncReady()) return fail('Set up and test sync first: the login file stores those details.');
+    if (pa.length < 12 || pb.length < 12) return fail('Each password needs at least 12 characters. Four random words works well.');
+    if (pa !== pa2) return fail(`${name('A')}'s two passwords do not match.`);
+    if (pb !== pb2) return fail(`${name('B')}'s two passwords do not match.`);
+    if (pa === pb) return fail('The two people need different passwords, so the app knows who is logging in.');
     out.innerHTML = '<p class="status-line">Encrypting…</p>';
-    const lock = await encryptConfig({ owner: sync.owner, repo: sync.repo, path: sync.path, branch: sync.branch, token: sync.token }, p1);
-    const text = `// Encrypted sync settings for Homebase. Safe to keep in a public repo.\nwindow.CHORES_LOCK = ${JSON.stringify(lock)};\n`;
+    const cfg = new TextEncoder().encode(JSON.stringify({ owner: sync.owner, repo: sync.repo, path: sync.path, branch: sync.branch, token: sync.token }));
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const users = {};
+    for (const [p, pass] of [['A', pa], ['B', pb]]) {
+      const key = await deriveKey(pass, salt, ITERATIONS);
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      users[p] = { iv: bytesToB64(iv), data: bytesToB64(new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, cfg))) };
+    }
+    const lock = { v: 2, iterations: ITERATIONS, salt: bytesToB64(salt), users };
+    const text = `// Encrypted sync settings for Homebase, one login per person. Safe to keep in a public repo.\nwindow.CHORES_LOCK = ${JSON.stringify(lock)};\n`;
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([text], { type: 'text/javascript' })); a.download = 'config.js';
     document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
     out.innerHTML = `<p class="status-line">config.js downloaded. Upload it to the app repo next to index.html. If the download didn't start, copy this into a new file called config.js:</p>
       <label class="f">config.js<textarea readonly id="lockText">${esc(text)}</textarea></label>
       <button class="btn ghost" id="copyLock">Copy</button>`;
-    $('#l-pass').value = ''; $('#l-pass2').value = '';
+    ['#l-passA', '#l-passA2', '#l-passB', '#l-passB2'].forEach((sel) => { $(sel).value = ''; });
   }
 
   /* ---------- Actions ---------- */
   function toggle(key) {
-    state.done[key] = { v: !isDone(key), by: me, at: new Date().toISOString() };
+    const it = findItem(key);
+    state.done[key] = { v: !isDone(key), by: me || (it ? it.person : ''), at: new Date().toISOString() };
     saveLocal(); render(); schedulePush();
   }
 
@@ -233,14 +292,16 @@
 
   function taskRow(it, compact) {
     const done = isDone(it.key);
-    const by = state.done[it.key] && state.done[it.key].by;
-    const byOther = done && by && by !== it.person ? `<span>ticked by ${esc(name(by))}</span>` : '';
+    const who = doer(it);
+    const byOther = done && who !== it.person ? `<span class="credit" data-p="${who}">done by ${esc(name(who))}</span>` : '';
+    const moved = it.moved ? `<span class="moved">${it.planned.person !== it.person ? `from ${esc(name(it.planned.person))}` : 'moved'}</span>` : '';
     const label = `${done ? 'Untick' : 'Tick'} ${it.chore.name}`;
     return `<li class="task${done ? ' done' : ''}">
       <button class="check" data-key="${esc(it.key)}" aria-pressed="${done}" aria-label="${esc(label)}">✓</button>
       <div class="t-body">
-        <div class="t-name">${esc(it.chore.name)}</div>
-        ${compact ? '' : `<div class="t-meta">${tagsFor(it.chore)}${byOther}</div>`}
+        <button class="t-name link" data-task="${esc(it.key)}">${esc(it.chore.name)}</button>
+        ${compact ? (byOther || moved ? `<div class="t-meta">${byOther}${moved}</div>` : '')
+          : `<div class="t-meta">${tagsFor(it.chore)}${byOther}${moved}<button class="mini" data-task="${esc(it.key)}">Reassign</button></div>`}
         ${!compact && it.chore.notes ? `<details class="how"><summary>How to</summary><p>${esc(it.chore.notes)}</p></details>` : ''}
       </div></li>`;
   }
@@ -249,7 +310,7 @@
   function viewToday() {
     const now = new Date();
     const w = R.weekIndexOf(now), d = R.dayIndexOf(now);
-    const week = R.buildWeek(state.chores, w);
+    const week = weekItems(w);
     let html = '';
     if (!me) {
       html += `<div class="banner"><h3>Whose phone is this?</h3>
@@ -263,6 +324,7 @@
       html += `<section class="person" data-p="${p}">
         <div class="person-head"><h3>${esc(name(p))}</h3><span class="lean">${LEAN[p]}</span>${me === p ? '<span class="you">You</span>' : ''}</div>
         ${tiles(todays)}
+        <div class="tile-label">This week: ${credited(week, p)} min of cleaning done</div>
         <ul class="tasks">${todays.map((i) => taskRow(i)).join('') || '<li class="empty">Nothing today.</li>'}</ul>
         ${missed.length ? `<details class="how" style="margin:4px 0 10px"><summary>${missed.length} left from earlier this week</summary>
           <ul class="tasks">${missed.map((i) => taskRow(i)).join('')}</ul></details>` : ''}
@@ -275,7 +337,7 @@
     const nowW = R.weekIndexOf(new Date());
     const w = nowW + weekOffset;
     const monday = R.mondayOfWeek(w);
-    const week = R.buildWeek(state.chores, w);
+    const week = weekItems(w);
     const todayIdx = weekOffset === 0 ? R.dayIndexOf(new Date()) : -1;
     const label = weekOffset === 0 ? 'This week' : weekOffset === 1 ? 'Next week' : weekOffset === -1 ? 'Last week'
       : `Week of ${fmtDate(monday, { day: 'numeric', month: 'short' })}`;
@@ -289,10 +351,12 @@
     for (const p of order()) {
       const mine = week.filter((i) => i.person === p);
       const total = mine.reduce((s, i) => s + i.chore.minutes, 0);
-      const done = mine.reduce((s, i) => s + (isDone(i.key) ? i.chore.minutes : 0), 0);
+      const done = credited(week, p);
+      const covered = week.filter((i) => i.person !== p && isDone(i.key) && doer(i) === p).reduce((s, i) => s + i.chore.minutes, 0);
       html += `<div class="person" data-p="${p}"><h3>${esc(name(p))}</h3>
-        <div class="tile-label" style="margin:4px 0 0">${done} of ${total} min</div>
-        <div class="bar"><i style="width:${total ? Math.round((done / total) * 100) : 0}%"></i></div></div>`;
+        <div class="tile-label" style="margin:4px 0 0">${done} min done of ${total} assigned</div>
+        <div class="bar"><i style="width:${total ? Math.min(100, Math.round((done / total) * 100)) : 0}%"></i></div>
+        ${covered ? `<div class="tile-label" style="margin:6px 0 0">Includes ${covered} min covering for ${esc(name(p === 'A' ? 'B' : 'A'))}</div>` : ''}</div>`;
     }
     html += '</div>';
 
@@ -312,7 +376,7 @@
 
   function viewChores() {
     const w = R.weekIndexOf(new Date());
-    const week = R.buildWeek(state.chores, w);
+    const week = weekItems(w);
     const tot = (p) => week.filter((i) => i.person === p).reduce((s, i) => s + i.chore.minutes, 0);
     let html = `<h2>Chores</h2><p class="lede">Tap a chore to change it. This week: ${esc(name('A'))} ${tot('A')} min, ${esc(name('B'))} ${tot('B')} min.</p>
       <div class="row" style="margin:0 0 14px"><button class="btn" id="addChore">Add chore</button></div>`;
@@ -332,24 +396,27 @@
 
   function viewLock() {
     return `<section class="card" style="margin-top:18px">
-      <h2 style="margin-top:0">Enter the household password</h2>
-      <label class="f">Password<input id="lock-pass" type="password" autocomplete="current-password" autofocus></label>
-      <label class="inline"><input type="checkbox" id="lock-keep" checked> Keep this phone unlocked</label>
-      <button class="btn" id="unlockBtn">Unlock</button>
+      <h2 style="margin-top:0">${LOGINS ? 'Log in' : 'Enter the household password'}</h2>
+      ${LOGINS ? '<p class="hint" style="margin:0 0 12px">Use your own password. It tells Homebase who you are.</p>' : ''}
+      <label class="f">${LOGINS ? 'Your password' : 'Password'}<input id="lock-pass" type="password" autocomplete="current-password" autofocus></label>
+      <label class="inline"><input type="checkbox" id="lock-keep" checked> ${LOGINS ? 'Keep me logged in on this device' : 'Keep this phone unlocked'}</label>
+      <button class="btn" id="unlockBtn">${LOGINS ? 'Log in' : 'Unlock'}</button>
       <p class="status-line" id="lock-msg"></p>
     </section>`;
   }
 
   function lockSection() {
-    const head = LOCK
-      ? `<h3>Password lock is on</h3><p class="hint" style="margin:6px 0 12px">To change the password or token, make a new lock file below and replace config.js in the app repo. Both phones will need the new password.</p>
-         <div class="row" style="margin-bottom:14px"><button class="btn ghost" id="lockNow">Lock this phone now</button></div>`
-      : `<h3>Password lock</h3><p class="hint" style="margin:6px 0 12px">Anyone with the link sees only a password box. The sync details are encrypted with the password, so nobody needs to paste the token on their phone.</p>`;
+    const head = LOGINS
+      ? `<h3>Logins are on</h3><p class="hint" style="margin:6px 0 12px">To change a password or the token, create a new login file below and replace config.js in the app repo. Everyone then logs in again.</p>`
+      : LOCK
+        ? `<h3>Switch to personal logins</h3><p class="hint" style="margin:6px 0 12px">You're using one household password. Give each person their own password instead, and Homebase will know who is ticking without setting up each phone.</p>`
+        : `<h3>Logins</h3><p class="hint" style="margin:6px 0 12px">Give each person their own password. Anyone with the link sees only a login box, and the password decides who is logged in, on any phone or laptop.</p>`;
+    const pw = (p) => `<label class="f">${esc(name(p))}'s password<input id="l-pass${p}" type="password" autocomplete="new-password"></label>
+      <label class="f">${esc(name(p))}'s password again<input id="l-pass${p}2" type="password" autocomplete="new-password"></label>`;
     return `<section class="card">${head}
-      <label class="f">New password<input id="l-pass" type="password" autocomplete="new-password"></label>
-      <label class="f">Same password again<input id="l-pass2" type="password" autocomplete="new-password"></label>
-      <p class="hint">At least 12 characters. Four random words, like "kettle orbit maple drum", is strong and easy to type.</p>
-      <button class="btn" id="makeLock">Create lock file</button>
+      ${pw('A')}${pw('B')}
+      <p class="hint">At least 12 characters each, and different from each other. Four random words, like "kettle orbit maple drum", is strong and easy to type.</p>
+      <button class="btn" id="makeLock">Create login file</button>
       <div id="lockOut"></div>
     </section>`;
   }
@@ -361,11 +428,13 @@
         <label class="f">Person A<input id="s-nameA" value="${esc(name('A'))}" maxlength="24"></label>
         <label class="f">Person B<input id="s-nameB" value="${esc(name('B'))}" maxlength="24"></label>
       </div>
-      <label class="f">This phone belongs to<select id="s-me">
+      ${LOGINS
+        ? `<p class="hint" style="margin:0 0 12px">Logged in as <strong>${esc(name(me))}</strong>.</p>`
+        : `<label class="f">This phone belongs to<select id="s-me">
         <option value="">Not set</option>
         <option value="A"${me === 'A' ? ' selected' : ''}>${esc(name('A'))}</option>
         <option value="B"${me === 'B' ? ' selected' : ''}>${esc(name('B'))}</option>
-      </select></label>
+      </select></label>`}
       <button class="btn" id="s-savePeople">Save people</button>
     </section>
 
@@ -402,6 +471,10 @@
     // Don't wipe a half-typed settings form when a background sync lands.
     if (fromSync && tab === 'settings' && document.activeElement && document.activeElement.closest('#view')) return;
     $('nav.tabs').hidden = !unlocked;
+    const who = $('#whoBtn');
+    who.hidden = !unlocked || !LOCK;
+    who.textContent = LOGINS ? `${name(me)} · Log out` : 'Lock';
+    who.dataset.p = LOGINS ? me : '';
     if (!unlocked) { $('#view').innerHTML = viewLock(); return; }
     const scroll = window.scrollY;
     const views = { today: viewToday, week: viewWeek, chores: viewChores, settings: viewSettings };
@@ -409,6 +482,40 @@
     document.querySelectorAll('nav.tabs button').forEach((b) => b.setAttribute('aria-current', b.dataset.tab === tab ? 'page' : 'false'));
     if (tab === 'settings') setStatus($('#syncDot').dataset.s, lastError);
     if (fromSync || tab !== 'settings') window.scrollTo(0, scroll);
+  }
+
+  /* ---------- Reassign or correct a single task ---------- */
+  let taskKey = null;
+  function openTask(key) {
+    const it = findItem(key);
+    if (!it) return;
+    taskKey = key;
+    const monday = R.mondayOfWeek(Number(key.split(':')[0]));
+    $('#taskTitle').textContent = it.chore.name;
+    $('#t-info').textContent = `${it.chore.minutes} min. On the rota for ${name(it.planned.person)} on ${R.DAYS[it.planned.day]}.`;
+    const opt = (v, t, sel) => `<option value="${v}"${sel ? ' selected' : ''}>${esc(t)}</option>`;
+    $('#t-person').innerHTML = opt('A', name('A'), it.person === 'A') + opt('B', name('B'), it.person === 'B');
+    $('#t-day').innerHTML = R.DAYS.map((d, i) => {
+      const date = new Date(monday); date.setDate(monday.getDate() + i);
+      return opt(i, fmtDate(date, { weekday: 'long', day: 'numeric', month: 'short' }), it.day === i);
+    }).join('');
+    const done = isDone(key), who = doer(it);
+    $('#t-done').innerHTML = opt('', 'Not done yet', !done) + opt('A', `Done by ${name('A')}`, done && who === 'A') + opt('B', `Done by ${name('B')}`, done && who === 'B');
+    $('#t-reset').hidden = !it.moved;
+    $('#taskDlg').showModal();
+  }
+  function saveTask(reset) {
+    const it = findItem(taskKey);
+    const at = new Date().toISOString();
+    state.moves = state.moves || {};
+    if (reset) state.moves[taskKey] = { person: '', day: -1, at };
+    else {
+      const person = $('#t-person').value, day = Number($('#t-day').value);
+      if (person !== it.person || day !== it.day) state.moves[taskKey] = { person, day, at };
+      const by = $('#t-done').value;
+      if (by !== (isDone(taskKey) ? doer(it) : '')) state.done[taskKey] = { v: !!by, by, at };
+    }
+    $('#taskDlg').close(); saveLocal(); render(); schedulePush();
   }
 
   /* ---------- Chore editor ---------- */
@@ -458,6 +565,7 @@
     if (!t) return;
     if (t.dataset.tab) { tab = t.dataset.tab; if (tab === 'week') weekOffset = 0; render(); window.scrollTo(0, 0); return; }
     if (t.dataset.key) return toggle(t.dataset.key);
+    if (t.dataset.task) return openTask(t.dataset.task);
     if (t.dataset.me) { me = t.dataset.me; localStorage.setItem(LS_ME, me); return render(); }
     if (t.dataset.week !== undefined) { weekOffset = t.dataset.week === '0' ? 0 : weekOffset + Number(t.dataset.week); return render(); }
     if (t.dataset.edit) return openEditor(t.dataset.edit);
@@ -465,6 +573,12 @@
       case 'unlockBtn': unlock(); break;
       case 'makeLock': makeLockFile(); break;
       case 'copyLock': $('#lockText').select(); navigator.clipboard && navigator.clipboard.writeText($('#lockText').value); t.textContent = 'Copied'; break;
+      case 'whoBtn':
+        if (!LOGINS || confirm(`Log out ${name(me)}?`)) {
+          try { localStorage.removeItem(LS_UNLOCK); sessionStorage.removeItem(LS_UNLOCK); } catch { /* blocked */ }
+          location.reload();
+        }
+        break;
       case 'lockNow':
         try { localStorage.removeItem(LS_UNLOCK); sessionStorage.removeItem(LS_UNLOCK); } catch { /* blocked */ }
         location.reload(); break;
@@ -472,6 +586,9 @@
       case 'addChore': openEditor(null); break;
       case 'f-save': saveEditor(); break;
       case 'f-cancel': $('#editDlg').close(); break;
+      case 't-save': saveTask(false); break;
+      case 't-reset': saveTask(true); break;
+      case 't-cancel': $('#taskDlg').close(); break;
       case 'f-delete':
         if (confirm('Delete this chore? Past ticks for it will be kept.')) {
           state.chores = state.chores.filter((c) => c.id !== editingId); $('#editDlg').close(); touchConfig(); render();
@@ -479,7 +596,7 @@
         break;
       case 's-savePeople':
         state.people = { A: { name: $('#s-nameA').value.trim() || 'Person A' }, B: { name: $('#s-nameB').value.trim() || 'Person B' } };
-        me = $('#s-me').value; localStorage.setItem(LS_ME, me);
+        if (!LOGINS) { me = $('#s-me').value; localStorage.setItem(LS_ME, me); }
         touchConfig(); render(); break;
       case 's-saveSync':
         sync = { owner: $('#s-owner').value.trim(), repo: $('#s-repo').value.trim(), path: $('#s-path').value.trim() || 'chores.json',
