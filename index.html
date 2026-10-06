@@ -150,6 +150,17 @@ label.inline input { width: 22px; height: 22px; }
 
 .banner { background: var(--paper); border-radius: 14px; padding: 14px; margin-bottom: 14px; border: 2px dashed var(--grout); }
 
+.t-name.link { display: block; background: none; border: 0; padding: 0; text-align: left; font: inherit; font-weight: 700; color: inherit; }
+.day-cols .t-name.link { font-weight: 400; font-size: 15px; line-height: 1.3; }
+li.task.done .t-name.link { text-decoration: line-through; color: var(--muted); }
+.mini { background: none; border: 1px solid var(--grout); border-radius: 6px; padding: 0 8px; font-size: 13px; color: var(--muted); }
+.credit { font-weight: 700; }
+.credit[data-p="A"] { color: var(--a); }
+.credit[data-p="B"] { color: var(--b); }
+.moved { font-style: italic; }
+.who { background: var(--paper); border: 1px solid var(--grout); border-radius: 99px; padding: 6px 12px; font-size: 14px; }
+.who[data-p="A"] { border-color: var(--a); color: var(--a); }
+.who[data-p="B"] { border-color: var(--b); color: var(--b); }
 dialog { border: 0; border-radius: 16px; padding: 0; width: min(560px, 94vw); background: var(--paper); color: var(--ink); }
 dialog::backdrop { background: rgba(10, 20, 20, .45); }
 dialog .card { margin: 0; max-height: 86vh; overflow-y: auto; }
@@ -168,6 +179,7 @@ nav.tabs button[aria-current="page"] { color: var(--ink); font-weight: 700; box-
 <body>
 <header class="top">
   <h1>Homebase</h1>
+  <button class="who" id="whoBtn" hidden></button>
   <button class="sync-dot" id="syncDot" data-s="off" title="Sync is off" aria-label="Sync status"></button>
 </header>
 
@@ -179,6 +191,25 @@ nav.tabs button[aria-current="page"] { color: var(--ink); font-weight: 700; box-
   <button data-tab="chores">Chores</button>
   <button data-tab="settings">Settings</button>
 </nav>
+
+<dialog id="taskDlg" aria-labelledby="taskTitle">
+  <div class="card">
+    <h2 id="taskTitle" style="margin-top:0">Task</h2>
+    <p class="hint" id="t-info" style="margin:0 0 14px"></p>
+    <div class="two">
+      <label class="f">Assigned to<select id="t-person"></select></label>
+      <label class="f">Day<select id="t-day"></select></label>
+    </div>
+    <label class="f">Done?<select id="t-done"></select></label>
+    <p class="hint">This changes this one task only. To change it every week, edit the chore in the Chores tab.</p>
+    <div class="row">
+      <button class="btn" id="t-save">Save</button>
+      <button class="btn ghost" id="t-cancel">Cancel</button>
+      <span style="flex:1"></span>
+      <button class="btn ghost" id="t-reset">Back to rota</button>
+    </div>
+  </div>
+</dialog>
 
 <dialog id="editDlg" aria-labelledby="editTitle">
   <div class="card">
@@ -225,7 +256,7 @@ nav.tabs button[aria-current="page"] { color: var(--ink); font-weight: 700; box-
 </dialog>
 
 <script src="rota.js"></script>
-<script src="config.js"></script><!-- optional: created in Settings → Password lock -->
+<script src="config.js"></script><!-- optional: created in Settings → Logins -->
 <script src="app.js"></script>
 </body>
 </html>

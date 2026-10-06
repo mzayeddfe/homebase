@@ -25,6 +25,14 @@ Tested over two years of weeks with the default list: no day over 30 minutes, we
 
 If you add chores and a day goes over 30 minutes, the Week view shows it in red. Shorten or remove something, or make it less frequent.
 
+## Covering and reassigning
+
+- **Covering for someone:** tick any task on either person's list. The minutes count towards whoever ticked it (the phone's owner), and the task shows "done by …". The Week view shows each person's minutes done, including time spent covering.
+- **Reassigning:** tap a task's name (or **Reassign**) to move it to the other person or another day. This changes that one task only; the rota carries on as normal the following week. **Back to rota** undoes it.
+- **Correcting a tick:** the same screen has a **Done?** box, so if a task was ticked on the wrong phone you can change who gets the credit.
+
+To change a chore permanently, edit it in the **Chores** tab instead (for example, set **Who** to always one person).
+
 ## 1. Put the app online (GitHub Pages)
 
 1. On GitHub, create a new **public** repository called `homebase`. (Pages is only free on public repos. No chore data is stored here.)
@@ -49,20 +57,24 @@ The dot in the top corner shows sync status: green synced, amber syncing, red fa
 
 **About the token:** it can only read and write that one private repo, and it's stored in each phone's browser. Share it with your housemate privately (not in a group chat). If a phone is lost, delete the token on GitHub and make a new one.
 
-## 3. Add a password lock
+## 3. Add logins
 
-1. Once sync works on one phone (or a laptop), go to **Settings → Password lock**, enter a password twice and tap **Create lock file**. This downloads `config.js`.
-2. Upload `config.js` to the app repo, next to `index.html`.
-3. From then on, the link shows only a password box. Entering the password unlocks the app and sets up sync automatically, so your housemate doesn't need the token, just the password.
+1. Once sync works on one device, go to **Settings → Logins**. Enter a password for each person (twice each) and tap **Create login file**. This downloads `config.js`.
+2. Upload `config.js` to the app repo, next to `index.html` (replace any older one).
+3. From then on, the link shows a login box. Each person logs in with their own password, on any phone or laptop, and Homebase knows who they are: ticks are credited to whoever is logged in. The header shows who's logged in, and tapping it logs out.
 
-**How it works:** `config.js` holds your sync details (including the token) encrypted with AES-256, using a key derived from the password with 600,000 rounds of PBKDF2. Without the password it's unreadable, so it's safe in a public repo.
+Nobody needs the GitHub token on their phone; logging in sets up sync automatically.
+
+**How it works:** `config.js` holds the sync details (including the token) encrypted twice with AES-256, once with each person's password (keys derived with 600,000 rounds of PBKDF2). Whichever copy your password opens tells the app who you are. Without either password the file is unreadable, so it's safe in a public repo.
 
 **What it does and doesn't protect:**
-- Your chore data (names, ticks, edited chores) was already private: it lives in the private repo, which needs the token. The lock now also hides it behind the password.
-- The app's code and the default chore list in `rota.js` are still publicly readable on GitHub. That's generic, but don't put anything personal in the code files.
-- Because the encrypted file is public, someone could try guessing passwords offline. Use 12+ characters; four random words is plenty for this.
-- "Keep this phone unlocked" skips the password on that phone. Untick it to be asked every time, or use **Lock this phone now** in Settings.
-- To change the password or token, create a new lock file and replace `config.js`.
+- Your data (names, ticks, edits) lives in the private repo and is only reachable after logging in.
+- It's a household login, not a security boundary between the two of you: both logins unlock the same data, and either person can still mark a task as done by the other in the task screen (useful for fixing mistakes).
+- The code and default chore list in the public repo are readable by anyone. Don't put anything personal in the code files.
+- Because `config.js` is public, someone could try guessing passwords offline. Use 12+ characters each; four random words is plenty.
+- "Keep me logged in on this device" skips the login next time. Untick it on shared devices.
+- To change a password or the token, create a new login file and replace `config.js`. Everyone logs in again.
+- An older single-password `config.js` still works as before, with "This phone belongs to" in Settings.
 
 ## 4. Add it to your home screen
 
@@ -74,7 +86,7 @@ The dot in the top corner shows sync status: green synced, amber syncing, red fa
 | File | What it does |
 |---|---|
 | `index.html` | Layout, styles and the chore editor |
-| `config.js` | Optional. Encrypted sync settings, created in Settings → Password lock |
+| `config.js` | Optional. Encrypted logins and sync settings, created in Settings → Logins |
 | `rota.js` | Default chore list and the scheduling rules. No browser code, so you can test it with Node |
 | `app.js` | Screens, ticking, editing, sync and backups |
 
